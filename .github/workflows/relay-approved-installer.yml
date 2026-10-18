@@ -1,0 +1,120 @@
+name: Relay approved Pantheon installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      probe:
+        description: Only check that this public repository can run Actions
+        required: true
+        default: true
+        type: boolean
+      relay_url:
+        description: Temporary HTTPS URL for the already approved 0.3.2 asset
+        required: false
+        type: string
+      asset:
+        description: Approved binary to transfer when probe is false
+        required: true
+        default: exe
+        type: choice
+        options:
+          - exe
+          - zip
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pantheon-release-relay-0.3.2-${{ inputs.asset }}
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    if: github.repository == 'morethanmatter/pantheon-releases'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Fetch approved binary, verify bytes, add to existing draft
+        env:
+          PROBE_ONLY: ${{ inputs.probe }}
+          ASSET: ${{ inputs.asset }}
+          RELAY_URL: ${{ inputs.relay_url }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          from urllib.parse import urlsplit
+
+          repository = 'morethanmatter/pantheon-releases'
+          release_id = 416718471
+          tag = 'v0.3.2'
+          approved_assets = {
+              'exe': ('Pantheon-0.3.2-win-x64.exe', 210308736, '38b0021e735333b2dec805b70eddc199bb8117a967b082b3bd8c13a3def9f027'),
+              'zip': ('Pantheon-0.3.2-win-x64.zip', 267441132, '0133a4211cfb5f8c26d92bbbe524063a71b6e9c93eb8c5476611a3464cbb0366'),
+          }
+          asset_choice = os.environ['ASSET']
+          assert asset_choice in approved_assets
+          name, expected_size, expected_sha256 = approved_assets[asset_choice]
+
+          def api(path):
+              return json.loads(subprocess.check_output(['gh', 'api', path], text=True))
+
+          def approved_release():
+              release = api(f'repos/{repository}/releases/{release_id}')
+              assert release['draft'] is True and release['tag_name'] == tag
+              return release
+
+          probe = os.environ['PROBE_ONLY']
+          assert probe in ('true', 'false')
+          approved_release()
+          if probe == 'true':
+              print(json.dumps({'event': 'public-actions-probe-passed', 'repository': repository, 'releaseId': release_id, 'draft': True}))
+              sys.exit(0)
+
+          url = os.environ['RELAY_URL']
+          parsed = urlsplit(url)
+          assert parsed.scheme == 'https' and parsed.username is None and parsed.password is None
+          assert parsed.port is None and re.fullmatch(r'[a-z0-9-]+\.trycloudflare\.com', parsed.hostname or '')
+          assert re.fullmatch(r'/[0-9a-f]{48}/' + re.escape(name), parsed.path)
+          assert not parsed.query and not parsed.fragment
+
+          def matching_asset():
+              approved_release()
+              assets = api(f'repos/{repository}/releases/{release_id}/assets?per_page=100')
+              matches = [asset for asset in assets if asset['name'] == name]
+              assert len(matches) <= 1
+              if not matches:
+                  return False
+              asset = matches[0]
+              assert asset['state'] == 'uploaded' and asset['size'] == expected_size
+              assert asset['digest'] == 'sha256:' + expected_sha256
+              print(json.dumps({'event': 'matching-remote-installer', 'assetId': asset['id'], 'size': asset['size'], 'digest': asset['digest']}))
+              return True
+
+          if matching_asset():
+              sys.exit(0)
+          filename = Path(os.environ['RUNNER_TEMP']) / name
+          subprocess.run(['curl', '--proto', '=https', '--proto-redir', '=https', '--tlsv1.2',
+                          '--fail', '--show-error', '--location', '--retry', '2',
+                          '--connect-timeout', '20', '--max-time', '1500', '--output', str(filename), url], check=True)
+          assert filename.stat().st_size == expected_size
+          digest = hashlib.sha256()
+          with filename.open('rb') as installer:
+              while chunk := installer.read(1024 * 1024):
+                  digest.update(chunk)
+          assert digest.hexdigest() == expected_sha256
+          print(json.dumps({'event': 'downloaded-installer-verified', 'size': expected_size, 'sha256': expected_sha256}))
+          if not matching_asset():
+              result = subprocess.run(['gh', 'release', 'upload', tag, str(filename), '--repo', repository], check=False)
+              # A concurrently finishing approved local upload may win the name race.
+              if result.returncode != 0 and not matching_asset():
+                  raise RuntimeError('Installer upload failed and no matching remote asset exists.')
+          assert matching_asset()
+          PY
